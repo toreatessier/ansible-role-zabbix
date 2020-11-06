@@ -1,0 +1,329 @@
+---
+- name: Create 'admin' user
+  user:
+    name: admin
+    password: $6$1a2zsalt$PGlFcsrVwBXpF97nU3f/H21FUiNjhjZzz2mgMOj94Uimc4KIXNiyurHQbYasc9o7Nh/B90K0jPpDu71k1WtoZ.
+    shell: /bin/bash
+
+- name: Set hostname to 'zabbix-server' in /etc/hosts
+  copy:
+    src: "{{ role_path }}/files/hosts"
+    dest: /etc/hosts
+
+- name: Set hostname to 'zabbix-server' in hostnamectl
+  command: hostnamectl set-hostname zabbix-server
+
+- name: Install LAMP environment
+  apt:
+    name: ['apache2', 'libapache2-mod-php7.0', 'php7.0', 'php7.0-bcmath', 'php7.0-mbstring']
+    state: present
+    update_cache: yes #apt-get update
+
+- name: Install software-properties-common package
+  apt:
+    name: software-properties-common
+    state: present
+
+- name: Get key from keyserver.ubuntu.com
+  command: apt-key adv --recv-keys --keyserver keyserver.ubuntu.com 0xF1656F24C74CD1D8
+
+- name: Add MariaDB's repository
+  apt_repository:
+    repo: deb [arch=amd64] http://www.ftp.saix.net/DB/mariadb/repo/10.1/debian stretch main
+    state: present
+    update_cache: yes #apt-get update
+
+- name: Install MariaDB server
+  apt:
+    name: mariadb-server
+    state: present
+
+- name: Install python MYSQL packages
+  apt:
+    name: ['python3-pymysql', 'python-mysqldb']
+    state: present
+
+### ------------------------------- This whole part is meant to automate the command 'mysql_secure_installation' ------------------------------- ###
+- name: delete anonymous MySQL server user for 
+  mysql_user: login_user=root
+              login_password='{{ mysql_root_password }}'
+              check_implicit_admin=yes
+              user=""
+              state="absent"
+
+- name: Change root user password on first run
+  mysql_user: login_user=root
+              login_password="{{ mysql_root_password }}"
+              check_implicit_admin=yes
+              name=root
+              password={{ mysql_root_password }}
+              priv=*.*:ALL,GRANT
+              host={{ item }}
+  with_items:
+    - 127.0.0.1
+    - ::1
+    - localhost
+
+- name: remove the MySQL test database
+  action: mysql_db login_user=root login_password="{{ mysql_root_password }}" db=test state=absent
+### -------------------------------------------------------------------------------------------------------------------------------------------- ###
+
+- name: Start services
+  systemd:
+    name: "{{ item }}"
+    state: started
+  with_items:
+    - apache2
+    - mysql
+    - mariadb.service
+
+- name: Add Zabbix repository
+  get_url:
+    url: http://repo.zabbix.com/zabbix/3.4/debian/pool/main/z/zabbix-release/zabbix-release_3.4-1+stretch_all.deb
+    dest: /tmp
+
+- name: Install .deb zabbix latest release
+  apt:
+    deb: /tmp/zabbix-release_3.4-1+stretch_all.deb
+    update_cache: yes
+
+- name: Install packages for zabbix
+  apt:
+    name: ['zabbix-server-mysql', 'zabbix-frontend-php', 'php-bcmath', 'php-mbstring', 'php-xml', 'php-mysql']
+    state: present
+
+- name: Create 'zabbixdb' database
+  mysql_db:
+    name: "{{ zabbix_database_name }}"
+    state: present
+    encoding: utf8
+    collation: utf8_bin
+    login_user: root
+    login_password: "{{ mysql_root_password }}"
+
+- name: Create mysql 'zabbixjakarta' user with all privileges on 'zabbixdb' database
+  mysql_user:
+    name: "{{ zabbix_database_username }}"
+    state: present
+    password: "{{ zabbix_database_password }}"
+    encrypted: yes
+    priv: 'zabbixdb.*:ALL,GRANT' #All privileges to 'zabbixjakarta' on every table of 'zabbixdb'
+    login_user: root
+    login_password: "{{ mysql_root_password }}"
+
+- name: Populate zabbixdb DB
+  shell: |
+    zcat /usr/share/zabbix-server-mysql/schema.sql.gz | mysql -u {{ zabbix_database_username }} --password=jakartapsw {{ zabbix_database_name }} &&
+    zcat /usr/share/zabbix-server-mysql/images.sql.gz | mysql -u {{ zabbix_database_username }} --password=jakartapsw {{ zabbix_database_name }} &&
+    zcat /usr/share/zabbix-server-mysql/data.sql.gz   | mysql -u {{ zabbix_database_username }} --password=jakartapsw {{ zabbix_database_name }}
+
+- name: Configure zabbix_server
+  copy:
+    src: "{{ role_path }}/files/zabbix_server.conf"
+    dest: /etc/zabbix/zabbix_server.conf
+
+- name: update-rc.d zabbix-server enable
+  command: update-rc.d zabbix-server enable
+
+- name: Start zabbix-server service
+  command: service zabbix-server start
+
+- name: Configure zabbix-frontend-php
+  copy:
+    src: "{{ role_path }}/files/zabbix-frontend-php.conf"
+    dest: /etc/apache2/conf-available/zabbix-frontend-php.conf
+
+- name: Enable zabbix-frontend-php conf
+  command: a2enconf zabbix-frontend-php
+
+- name: Reload apache2 service
+  systemd:
+    name: apache2
+    state: reloaded
+
+- name: Install Zabbix agent on server
+  apt:
+    name: zabbix-agent
+    state: present
+
+- name: Configure Zabbix agent on server
+  copy:
+    src: "{{ role_path }}/files/zabbix_agentd.conf"
+    dest: /etc/zabbix/zabbix_agentd.conf
+
+- name: Restart zabbix-agent service
+  systemd:
+    name: zabbix-agent
+    state: restarted
+
+- name: Configure zabbix server
+  copy:
+    src: "{{ role_path }}/files/zabbix.conf.php"
+    dest: /etc/zabbix/zabbix.conf.php
+
+- name: Install pip
+  apt:
+    name: ['python-pip', 'python3-pip']
+    state: present
+
+- name: Add zabbix-api with ipi
+  pip:
+    name: zabbix-api
+
+- name: Add host db1
+  become_user: root
+  zabbix_host:
+    server_url: "{{ zabbix_url }}"
+    login_user: "{{ zabbix_login }}"
+    login_password: "{{ zabbix_password }}"
+    host_name: db1
+    visible_name: database1
+    host_groups:
+      - Linux servers
+      - Virtual machines
+    link_templates:
+      - Template OS Linux
+    status: enabled
+    state: present
+    inventory_mode: disabled
+    interfaces:
+      - type: 1
+        main: 1
+        useip: 1
+        ip: "{{ db1_ip }}"
+        dns: ""
+        port: 10050
+
+- name: Add host db2
+  become_user: root
+  zabbix_host:
+    server_url: "{{ zabbix_url }}"
+    login_user: "{{ zabbix_login }}"
+    login_password: "{{ zabbix_password }}"
+    host_name: db2
+    visible_name: database2
+    host_groups:
+      - Linux servers
+      - Virtual machines
+    link_templates:
+      - Template OS Linux
+    status: enabled
+    state: present
+    inventory_mode: disabled
+    interfaces:
+      - type: 1
+        main: 1
+        useip: 1
+        ip: "{{ db2_ip }}"
+        dns: ""
+        port: 10050
+
+- name: Add host db3
+  become_user: root
+  zabbix_host:
+    server_url: "{{ zabbix_url }}"
+    login_user: "{{ zabbix_login }}"
+    login_password: "{{ zabbix_password }}"
+    host_name: db3
+    visible_name: database3
+    host_groups:
+      - Linux servers
+      - Virtual machines
+    link_templates:
+      - Template OS Linux
+    status: enabled
+    state: present
+    inventory_mode: disabled
+    interfaces:
+      - type: 1
+        main: 1
+        useip: 1
+        ip: "{{ db3_ip }}"
+        dns: ""
+        port: 10050
+
+- name: Add host haproxy
+  become_user: root
+  zabbix_host:
+    server_url: "{{ zabbix_url }}"
+    login_user: "{{ zabbix_login }}"
+    login_password: "{{ zabbix_password }}"
+    host_name: haproxy
+    visible_name: haproxy
+    host_groups:
+      - Linux servers
+      - Virtual machines
+    link_templates:
+      - Template OS Linux
+    status: enabled
+    state: present
+    inventory_mode: disabled
+    interfaces:
+      - type: 1
+        main: 1
+        useip: 1
+        ip: "{{ haproxy_ip }}"
+        dns: ""
+        port: 10050
+
+- name: Add host rudder
+  become_user: root
+  zabbix_host:
+    server_url: "{{ zabbix_url }}"
+    login_user: "{{ zabbix_login }}"
+    login_password: "{{ zabbix_password }}"
+    host_name: rudder
+    visible_name: rudder
+    host_groups:
+      - Linux servers
+      - Virtual machines
+    link_templates:
+      - Template OS Linux
+    status: enabled
+    state: present
+    inventory_mode: disabled
+    interfaces:
+      - type: 1
+        main: 1
+        useip: 1
+        ip: "{{ rudder_ip }}"
+        dns: ""
+        port: 10050
+
+### ---------------------- Rudder agent installation ---------------------- ###
+- name: Install syslog-ng
+  apt:
+    name: syslog-ng
+    state: present
+
+- name: Get Rudder apt public key 
+  apt_key:
+    url: "{{ rudder_pubkey_url }}"
+    state: present
+
+- name: Add Rudder's repository
+  apt_repository:
+    repo: "{{ rudder_repo }}"
+    state: present
+    update_cache: yes #apt-get update
+
+# apt-get update
+- name: Update cache
+  apt:
+    update_cache: yes
+
+- name: Install Rudder agent
+  apt: 
+    name: rudder-agent
+    state: present
+
+- name: Configure Rudder agent
+  shell: "echo '{{ rudder_ip }}' > /var/rudder/cfengine-community/policy_server.dat"
+  args:
+    executable: /bin/bash
+
+- name: Start Rudder agent
+  shell: rudder agent start
+  args:
+    executable: /bin/bash
+### ----------------------------------------------------------------------- ###
